@@ -20,13 +20,15 @@ const client = new Client({
     ]
 });
 
-// In-memory join order per guild (resets on bot restart)
-const joinOrder = {}; // guildId -> Map<userId, true>
+// In-memory tracking per guild
+const joinOrder = {};      // guildId -> array of userIds currently in VC
+const joinedOnce = {};     // guildId -> Set of userIds who have ever joined (for logging)
 
+// Bot ready
 client.once('clientReady', async c => {
     console.log(`Logged in as ${c.user.tag}`);
 
-    // Register slash command for all guilds
+    // Register /setchannels command for all guilds
     const commands = [
         new SlashCommandBuilder()
             .setName("setchannels")
@@ -42,6 +44,40 @@ client.once('clientReady', async c => {
     }
 
     console.log("✅ /setchannels command registered");
+
+    // Initialize join order for members already in voice channels
+    for (const guild of client.guilds.cache.values()) {
+        const config = await getGuildConfig(guild.id);
+        if (!config) continue;
+
+        if (!joinOrder[guild.id]) joinOrder[guild.id] = [];
+        if (!joinedOnce[guild.id]) joinedOnce[guild.id] = new Set();
+
+        try {
+            const voiceChannel = await guild.channels.fetch(config.voice_channel_id);
+            const logChannel = await client.channels.fetch(config.log_channel_id);
+
+            if (voiceChannel && voiceChannel.members) {
+                voiceChannel.members.forEach(member => {
+                    // Add to join order if not already present
+                    if (!joinOrder[guild.id].includes(member.id)) {
+                        joinOrder[guild.id].push(member.id);
+                    }
+
+                    // Log them if not already logged
+                    if (!joinedOnce[guild.id].has(member.id)) {
+                        logChannel.send(`${member.user.tag} JOINED`);
+                        joinedOnce[guild.id].add(member.id);
+                    }
+                });
+
+                // Update the display
+                updateDisplay(guild.id);
+            }
+        } catch (err) {
+            console.error("Error initializing existing members:", err);
+        }
+    }
 });
 
 // Handle slash commands
@@ -54,7 +90,6 @@ client.on('interactionCreate', async interaction => {
         const textChannel = interaction.options.getChannel("text");
         const logChannel = interaction.options.getChannel("log");
 
-        // Upsert config into Supabase
         const { error } = await supabase
             .from('guild_config')
             .upsert({
@@ -69,14 +104,14 @@ client.on('interactionCreate', async interaction => {
             return interaction.reply("❌ Failed to save channels");
         }
 
-        // Initialize in-memory joinOrder
-        if (!joinOrder[guildId]) joinOrder[guildId] = new Map();
+        if (!joinOrder[guildId]) joinOrder[guildId] = [];
+        if (!joinedOnce[guildId]) joinedOnce[guildId] = new Set();
 
         await interaction.reply(`✅ Channels set:\nVoice: ${voiceChannel}\nText: ${textChannel}\nLog: ${logChannel}`);
     }
 });
 
-// Helper: get guild config from Supabase
+// Helper: fetch guild config
 async function getGuildConfig(guildId) {
     const { data, error } = await supabase
         .from('guild_config')
@@ -88,7 +123,7 @@ async function getGuildConfig(guildId) {
     return data;
 }
 
-// Update join order display
+// Update the join order display
 async function updateDisplay(guildId) {
     const config = await getGuildConfig(guildId);
     if (!config) return;
@@ -102,36 +137,42 @@ async function updateDisplay(guildId) {
         displayMessage = await textChannel.send("🔊 **Voice Join Order**\nWaiting for members...");
     }
 
-    const map = joinOrder[guildId] || new Map();
-    const vcChannel = await client.channels.fetch(config.voice_channel_id);
-    const membersInVC = vcChannel.members.map(m => m.id);
-
-    const filteredOrder = Array.from(map.keys()).filter(id => membersInVC.includes(id));
-
-    const text = filteredOrder.length > 0
-        ? `🔊 **Voice Join Order**\n${filteredOrder.map((id, i) => `${i + 1}. <@${id}>`).join("\n")}`
+    const text = joinOrder[guildId].length > 0
+        ? `🔊 **Voice Join Order**\n${joinOrder[guildId].map((id, i) => `${i + 1}. <@${id}>`).join("\n")}`
         : "🔊 **Voice Join Order**\nNo one is in the channel.";
 
     await displayMessage.edit(text);
 }
 
-// Voice state update
+// Handle voice state updates
 client.on('voiceStateUpdate', async (oldState, newState) => {
     try {
         const guildId = newState.guild.id;
+        const userId = newState.id;
         const config = await getGuildConfig(guildId);
         if (!config) return;
 
-        const userId = newState.id;
+        if (!joinOrder[guildId]) joinOrder[guildId] = [];
+        if (!joinedOnce[guildId]) joinedOnce[guildId] = new Set();
+
+        const oldChannel = oldState.channelId;
         const newChannel = newState.channelId;
 
-        if (!joinOrder[guildId]) joinOrder[guildId] = new Map();
+        // User joined tracked VC
+        if (newChannel === config.voice_channel_id) {
+            if (!joinOrder[guildId].includes(userId)) {
+                joinOrder[guildId].push(userId);
+            }
+            if (!joinedOnce[guildId].has(userId)) {
+                const logChannel = await client.channels.fetch(config.log_channel_id);
+                logChannel.send(`${newState.member.user.tag} JOINED`);
+                joinedOnce[guildId].add(userId);
+            }
+        }
 
-        if (newChannel === config.voice_channel_id && !joinOrder[guildId].has(userId)) {
-            joinOrder[guildId].set(userId, true);
-
-            const logChannel = await client.channels.fetch(config.log_channel_id);
-            logChannel.send(`${newState.member.user.tag} JOINED`);
+        // User left tracked VC
+        if (oldChannel === config.voice_channel_id && newChannel !== config.voice_channel_id) {
+            joinOrder[guildId] = joinOrder[guildId].filter(id => id !== userId);
         }
 
         updateDisplay(guildId);
